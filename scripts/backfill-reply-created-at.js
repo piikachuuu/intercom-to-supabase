@@ -103,27 +103,45 @@ function idCandidates(obj) {
 }
 
 function indexConversationParts(conversation) {
-  // Map: ANY known part identifier string -> created_at epoch seconds
+  // Map: id string -> created_at epoch seconds
   const map = new Map();
 
-  const add = (obj) => {
+  const convoFallback =
+    asNumber(conversation?.created_at) ??
+    asNumber(conversation?.updated_at) ??
+    null;
+
+  const add = (obj, fallbackEpoch = null) => {
     const created =
       asNumber(obj?.created_at) ??
       asNumber(obj?.sent_at) ??
       asNumber(obj?.delivered_at) ??
+      asNumber(obj?.created_at_unix) ??
+      fallbackEpoch ??
       null;
 
     if (!created) return;
 
-    for (const id of idCandidates(obj)) {
+    const ids = [
+      obj?.id,
+      obj?.part_id,
+      obj?.uuid,
+      obj?.message_id,
+      obj?.conversation_part_id,
+    ]
+      .filter((x) => x !== undefined && x !== null)
+      .map(String);
+
+    for (const id of new Set(ids)) {
       map.set(id, created);
     }
   };
 
-  if (conversation?.source) add(conversation.source);
+  // ✅ Key fix: add source using conversation.created_at as fallback timestamp
+  if (conversation?.source) add(conversation.source, convoFallback);
 
   const parts = conversation?.conversation_parts?.conversation_parts || [];
-  for (const p of parts) add(p);
+  for (const p of parts) add(p, null);
 
   return map;
 }
@@ -195,6 +213,7 @@ async function main() {
       await sleep(INTERCOM_DELAY_MS);
 
       const partIndex = indexConversationParts(conversation);
+      console.log("has source in index:", partIndex.has(String(conversation?.source?.id)));
       // DEBUG ONE SAMPLE: print IDs we have vs the DB part_id we want
 if (updated === 0 && missing === 0) {
   const src = conversation?.source;
