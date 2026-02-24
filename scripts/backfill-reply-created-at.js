@@ -195,7 +195,43 @@ async function main() {
       await sleep(INTERCOM_DELAY_MS);
 
       const partIndex = indexConversationParts(conversation);
+      // DEBUG ONE SAMPLE: print IDs we have vs the DB part_id we want
+if (updated === 0 && missing === 0) {
+  const src = conversation?.source;
+  const parts = conversation?.conversation_parts?.conversation_parts || [];
 
+  console.log("==== DEBUG SAMPLE START ====");
+  console.log("conversationId:", conversationId);
+  console.log("DB partIds (first 10):", partIds.slice(0, 10));
+
+  console.log("source id candidates:", {
+    id: src?.id,
+    part_id: src?.part_id,
+    uuid: src?.uuid,
+    message_id: src?.message_id,
+    type: src?.type,
+  });
+
+  console.log(
+    "parts count:",
+    parts.length
+  );
+
+  console.log(
+    "first 10 parts id candidates:",
+    parts.slice(0, 10).map((p) => ({
+      id: p?.id,
+      part_id: p?.part_id,
+      uuid: p?.uuid,
+      message_id: p?.message_id,
+      created_at: p?.created_at,
+      part_type: p?.part_type,
+      type: p?.type,
+    }))
+  );
+
+  console.log("==== DEBUG SAMPLE END ====");
+}
       for (const partId of partIds) {
         const createdAtEpoch = partIndex.get(String(partId));
         if (!createdAtEpoch) {
