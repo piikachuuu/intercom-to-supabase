@@ -8,9 +8,9 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
 });
 
-async function fetchConversationTags(conversationId) {
+async function fetchConversation(conversationId) {
   const res = await fetch(
-    `https://api.intercom.io/conversations/${encodeURIComponent(conversationId)}/tags`,
+    `https://api.intercom.io/conversations/${encodeURIComponent(conversationId)}`,
     {
       headers: {
         Authorization: `Bearer ${INTERCOM_ACCESS_TOKEN}`,
@@ -21,14 +21,27 @@ async function fetchConversationTags(conversationId) {
 
   if (!res.ok) {
     const t = await res.text().catch(() => "");
-    console.log(`Tags fetch failed convo=${conversationId} status=${res.status} body=${t.slice(0,200)}`);
+    console.log(
+      `Conversation fetch failed convo=${conversationId} status=${res.status} body=${t.slice(0, 200)}`
+    );
     return null;
   }
 
-  const json = await res.json();
-  const tags = Array.isArray(json?.tags) ? json.tags : [];
-  const joined = tags.map((t) => t?.name).filter(Boolean).join(", ");
-  return joined || ""; // empty string means "no tags"
+  return res.json();
+}
+
+function extractTagsFromConversation(conversation) {
+  const t1 = conversation?.tags?.tags;
+  const t2 = conversation?.tags?.data;
+  const t3 = conversation?.tags;
+
+  const arr =
+    (Array.isArray(t1) && t1) ||
+    (Array.isArray(t2) && t2) ||
+    (Array.isArray(t3) && t3) ||
+    [];
+
+  return arr.map((t) => t?.name).filter(Boolean).join(", ");
 }
 
 async function main() {
@@ -61,29 +74,31 @@ async function main() {
 
   let updatedConvos = 0;
 
-  for (const convoId of convos) {
-    const tags = await fetchConversationTags(convoId);
+for (const convoId of convos) {
+  const convo = await fetchConversation(convoId);
+  if (!convo) continue;
 
-    // If Intercom says no tags, we can either keep NULL or set empty string.
-    // I recommend keeping NULL to mean "no tags".
-    const newValue = tags ? tags : null;
+  const tags = extractTagsFromConversation(convo);
+  const newValue = tags ? tags : null;
 
-    const { error } = await supabase
-      .from("replies")
-      .update({ tags: newValue })
-      .eq("conversation_id", convoId)
-      .is("tags", null);
+  const { error } = await supabase
+    .from("replies")
+    .update({ tags: newValue })
+    .eq("conversation_id", convoId)
+    .is("tags", null);
 
-    if (error) {
-      console.log(`Update failed convo=${convoId}: ${error.message}`);
-      continue;
-    }
-
-    updatedConvos++;
-    if (updatedConvos % 25 === 0) console.log(`Updated ${updatedConvos}/${convos.size} conversations...`);
+  if (error) {
+    console.log(`Update failed convo=${convoId}: ${error.message}`);
+    continue;
   }
 
-  console.log("Backfill complete.");
+  updatedConvos++;
+  if (updatedConvos % 25 === 0) {
+    console.log(`Updated ${updatedConvos}/${convos.size} conversations...`);
+  }
+}
+
+console.log("Backfill complete.");
 }
 
 main().catch((e) => {
