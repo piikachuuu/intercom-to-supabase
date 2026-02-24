@@ -6,7 +6,7 @@
   "scripts": {
   "sync": "node src/sync.js",
   "backfill:tags": "node src/backfill_tags.js"
-}
+},
   "dependencies": {
     "@supabase/supabase-js": "^2.49.1"
   }
