@@ -46,21 +46,42 @@ function asNumber(v) {
   return Number.isFinite(n) ? n : null;
 }
 
+function idCandidates(obj) {
+  const cands = [
+    obj?.id,
+    obj?.part_id,
+    obj?.uuid,
+    obj?.message_id,
+    obj?.conversation_part_id,
+  ]
+    .filter((x) => x !== undefined && x !== null)
+    .map(String);
+
+  return [...new Set(cands)];
+}
+
 function indexConversationParts(conversation) {
-  // Map: part_id (string) -> created_at epoch seconds (number)
+  // Map: ANY known part identifier string -> created_at epoch seconds
   const map = new Map();
 
-  const src = conversation?.source;
-  const srcId = src?.id ?? src?.part_id;
-  const srcCreated = asNumber(src?.created_at ?? src?.sent_at ?? src?.delivered_at);
-  if (srcId && srcCreated) map.set(String(srcId), srcCreated);
+  const add = (obj) => {
+    const created =
+      asNumber(obj?.created_at) ??
+      asNumber(obj?.sent_at) ??
+      asNumber(obj?.delivered_at) ??
+      null;
+
+    if (!created) return;
+
+    for (const id of idCandidates(obj)) {
+      map.set(id, created);
+    }
+  };
+
+  if (conversation?.source) add(conversation.source);
 
   const parts = conversation?.conversation_parts?.conversation_parts || [];
-  for (const p of parts) {
-    const pid = p?.id ?? p?.part_id;
-    const created = asNumber(p?.created_at ?? p?.sent_at ?? p?.delivered_at);
-    if (pid && created) map.set(String(pid), created);
-  }
+  for (const p of parts) add(p);
 
   return map;
 }
