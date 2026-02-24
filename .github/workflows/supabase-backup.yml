@@ -1,0 +1,54 @@
+name: Supabase DB Backup (to Releases)
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # daily 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write # required to create releases
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install Postgres client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Make dated filenames
+        id: meta
+        run: |
+          echo "DATE=$(date -u +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+          echo "TS=$(date -u +'%Y%m%dT%H%M%SZ')" >> $GITHUB_OUTPUT
+
+      - name: Dump database (custom format)
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          pg_dump "$SUPABASE_DB_URL" \
+            --format=custom \
+            --no-owner \
+            --no-privileges \
+            --file "backup_${{ steps.meta.outputs.TS }}.dump"
+
+      - name: Compress
+        run: gzip -9 "backup_${{ steps.meta.outputs.TS }}.dump"
+
+      - name: Create GitHub Release + upload asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: supabase-backup-${{ steps.meta.outputs.DATE }}
+          name: Supabase backup ${{ steps.meta.outputs.DATE }}
+          files: backup_${{ steps.meta.outputs.TS }}.dump.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete releases older than 14 days
+        uses: dev-drprasad/delete-older-releases@v0.3.4
+        with:
+          keep_latest: 14
+          delete_tags: true
+          delete_tag_pattern: "^supabase-backup-"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
