@@ -214,7 +214,7 @@ async function insertReplies(rows) {
 
   // data will include both inserted and updated, but we never update fields usually.
   // It’s still fine for “at least once” semantics.
-  return { inserted: data?.length ?? 0 };
+  return { upserted: data?.length ?? 0 };
 }
 
 // ---------- Backfill initialization helper ----------
@@ -322,8 +322,8 @@ async function runBackfillOnce() {
     }
 
     if (rows.length) {
-      const { inserted } = await insertReplies(rows);
-      totalRows += inserted;
+      const { upserted } = await insertReplies(rows);
+      totalRows += upserted;
     }
 
     pages++;
@@ -442,8 +442,8 @@ async function runLiveOnce() {
     }
 
     if (rows.length) {
-      const { inserted } = await insertReplies(rows);
-      totalRows += inserted;
+      const { upserted } = await insertReplies(rows);
+      totalRows += upserted;
     }
 
     pages++;
