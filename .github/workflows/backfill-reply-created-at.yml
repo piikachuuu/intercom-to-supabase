@@ -41,4 +41,4 @@ jobs:
           BACKFILL_BATCH_LIMIT: ${{ inputs.batch_limit }}
           INTERCOM_DELAY_MS: ${{ inputs.intercom_delay_ms }}
         run: |
-          node scripts/backfill-reply-created-at.mjs
+          node scripts/backfill-reply-created-at.js
