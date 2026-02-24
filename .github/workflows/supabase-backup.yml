@@ -2,7 +2,7 @@ name: Supabase DB Backup (to Releases)
 
 on:
   schedule:
-    - cron: "0 3 * * *"
+    - cron: "0 3 * * *" # runs daily at 03:00 UTC
   workflow_dispatch:
 
 permissions:
@@ -23,7 +23,7 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update
           sudo apt-get install -y postgresql-client-17
-          pg_dump --version
+          /usr/lib/postgresql/17/bin/pg_dump --version
 
       - name: Make dated filenames
         id: meta
@@ -35,13 +35,13 @@ jobs:
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
-          pg_dump "$SUPABASE_DB_URL" \
+          /usr/lib/postgresql/17/bin/pg_dump "$SUPABASE_DB_URL" \
             --format=custom \
             --no-owner \
             --no-privileges \
             --file "backup_${{ steps.meta.outputs.TS }}.dump"
 
-      - name: Compress
+      - name: Compress backup
         run: gzip -9 "backup_${{ steps.meta.outputs.TS }}.dump"
 
       - name: Create GitHub Release + upload asset
