@@ -2,19 +2,28 @@ name: Supabase DB Backup (to Releases)
 
 on:
   schedule:
-    - cron: "0 3 * * *" # daily 03:00 UTC
+    - cron: "0 3 * * *"
   workflow_dispatch:
 
 permissions:
-  contents: write # required to create releases
+  contents: write
 
 jobs:
   backup:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Install Postgres client
-        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: Install PostgreSQL client (v17)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl ca-certificates gnupg lsb-release
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
+          echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+          pg_dump --version
 
       - name: Make dated filenames
         id: meta
