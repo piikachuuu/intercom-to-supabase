@@ -25,12 +25,14 @@ function sleep(ms) {
 }
 
 async function fetchConversation(conversationId) {
-  const res = await fetch(`https://api.intercom.io/conversations/${conversationId}`, {
-    headers: {
-      Authorization: `Bearer ${INTERCOM_ACCESS_TOKEN}`,
-      Accept: "application/json",
-    },
-  });
+  const headers = {
+    Authorization: `Bearer ${INTERCOM_ACCESS_TOKEN}`,
+    Accept: "application/json",
+  };
+
+  // First page
+  const firstUrl = `https://api.intercom.io/conversations/${conversationId}`;
+  const res = await fetch(firstUrl, { headers });
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -38,7 +40,47 @@ async function fetchConversation(conversationId) {
       `Intercom fetch failed for conversation ${conversationId}: ${res.status} ${res.statusText} ${text}`
     );
   }
-  return res.json();
+
+  const conversation = await res.json();
+
+  // Collect parts from first page
+  const allParts = [
+    ...(conversation?.conversation_parts?.conversation_parts || []),
+  ];
+
+  // Follow pagination if present
+  let nextUri = conversation?.conversation_parts?.pages?.next?.uri || null;
+
+  while (nextUri) {
+    // Intercom's next.uri is usually a relative path like "/conversations/123?starting_after=..."
+    const url = nextUri.startsWith("http")
+      ? nextUri
+      : `https://api.intercom.io${nextUri}`;
+
+    const r = await fetch(url, { headers });
+    if (!r.ok) {
+      const text = await r.text().catch(() => "");
+      throw new Error(
+        `Intercom pagination fetch failed for conversation ${conversationId}: ${r.status} ${r.statusText} ${text}`
+      );
+    }
+
+    const page = await r.json();
+
+    const pageParts = page?.conversation_parts?.conversation_parts || [];
+    allParts.push(...pageParts);
+
+    nextUri = page?.conversation_parts?.pages?.next?.uri || null;
+
+    // be polite to rate limits
+    await sleep(INTERCOM_DELAY_MS);
+  }
+
+  // Put the hydrated parts back onto the original object
+  conversation.conversation_parts = conversation.conversation_parts || {};
+  conversation.conversation_parts.conversation_parts = allParts;
+
+  return conversation;
 }
 
 function asNumber(v) {
