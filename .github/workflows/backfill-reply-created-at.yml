@@ -1,0 +1,44 @@
+name: Backfill reply_created_at
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch_limit:
+        description: "Max rows to scan from Supabase where reply_created_at is NULL"
+        required: false
+        default: "5000"
+      intercom_delay_ms:
+        description: "Delay between Intercom conversation fetches (ms)"
+        required: false
+        default: "200"
+  # Optional: uncomment if you want it to run nightly until everything is filled
+  # schedule:
+  #   - cron: "0 9 * * *" # 9:00 UTC daily
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: |
+          npm ci || npm install
+
+      - name: Run backfill
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          INTERCOM_ACCESS_TOKEN: ${{ secrets.INTERCOM_ACCESS_TOKEN }}
+          BACKFILL_BATCH_LIMIT: ${{ inputs.batch_limit }}
+          INTERCOM_DELAY_MS: ${{ inputs.intercom_delay_ms }}
+        run: |
+          node scripts/backfill-reply-created-at.mjs
