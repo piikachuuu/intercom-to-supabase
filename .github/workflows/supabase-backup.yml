@@ -2,7 +2,7 @@ name: Supabase DB Backup (to Releases)
 
 on:
   schedule:
-    - cron: "0 3 * * *" # runs daily at 03:00 UTC
+    - cron: "0 3 * * *" # daily 03:00 UTC
   workflow_dispatch:
 
 permissions:
@@ -30,6 +30,23 @@ jobs:
         run: |
           echo "DATE=$(date -u +'%Y-%m-%d')" >> $GITHUB_OUTPUT
           echo "TS=$(date -u +'%Y%m%dT%H%M%SZ')" >> $GITHUB_OUTPUT
+
+      - name: Verify DB URL host (must be Session Pooler)
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          python3 - << 'PY'
+          import os, sys, urllib.parse
+          u = urllib.parse.urlparse(os.environ["SUPABASE_DB_URL"])
+          host = u.hostname or ""
+          port = u.port or ""
+          print("Using host:", host)
+          print("Using port:", port)
+          if "pooler.supabase.com" not in host:
+            print("\nERROR: SUPABASE_DB_URL is not a Session Pooler URL.")
+            print("Fix: Supabase Connect modal -> Method: Session pooler -> copy URI into GitHub secret SUPABASE_DB_URL")
+            sys.exit(1)
+          PY
 
       - name: Dump database (custom format)
         env:
