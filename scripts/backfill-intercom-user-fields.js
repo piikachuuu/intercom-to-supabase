@@ -3,32 +3,49 @@ import { createClient } from "@supabase/supabase-js";
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const INTERCOM_ACCESS_TOKEN = process.env.INTERCOM_ACCESS_TOKEN;
-console.log("SUPABASE_URL:", SUPABASE_URL);
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !INTERCOM_ACCESS_TOKEN) {
-  throw new Error(
-    "Missing env vars. Need SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, INTERCOM_ACCESS_TOKEN"
-  );
+
+function requireEnv(name) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env var: ${name}`);
+  return v;
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+requireEnv("SUPABASE_URL");
+requireEnv("SUPABASE_SERVICE_ROLE_KEY");
+requireEnv("INTERCOM_ACCESS_TOKEN");
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+// Avoid printing secrets. Logging the project URL host is fine.
+try {
+  const u = new URL(SUPABASE_URL);
+  console.log("Supabase host:", u.host);
+} catch {
+  console.log("Supabase URL provided (could not parse host).");
+}
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false },
+});
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function compactPatch(obj) {
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (v !== null && v !== undefined && v !== "") out[k] = v;
+  }
+  return out;
 }
 
 /**
- * Lead-safe extraction:
- * - Email-only is OK.
- * - user_name can be null.
- * - "external user id" should go into replies.user_id.
- *
- * We try multiple places:
- * - conversation.contacts.contacts[0].external_id (best for your external id)
- * - conversation.source.author.id / parts author id (fallbacks)
+ * Extract a "best effort" user identity from Intercom conversation JSON.
+ * Priority:
+ * - Email: source.author.email > first part author email > first contact email
+ * - Name:  source.author.name  > first part author name  > first contact name
+ * - user_id: contact.external_id (Sleeper user id) > fallback intercom ids
  */
 function extractUserFromConversation(conversation) {
-  const c0 = conversation?.contacts?.contacts?.[0] ?? null;
-  const sa = conversation?.source?.author ?? null;
+  const contact0 = conversation?.contacts?.contacts?.[0] ?? null;
+  const sourceAuthor = conversation?.source?.author ?? null;
 
   const parts = conversation?.conversation_parts?.conversation_parts ?? [];
   let partAuthor = null;
@@ -40,26 +57,25 @@ function extractUserFromConversation(conversation) {
     }
   }
 
-  const bestEmail = sa?.email ?? partAuthor?.email ?? c0?.email ?? null;
-  const bestName = sa?.name ?? partAuthor?.name ?? c0?.name ?? null;
+  const user_email =
+    sourceAuthor?.email ?? partAuthor?.email ?? contact0?.email ?? null;
 
-  // Your "external user id" (Sleeper user id) should come from Intercom contact external_id
-  const externalId = c0?.external_id ?? null;
+  const user_name =
+    sourceAuthor?.name ?? partAuthor?.name ?? contact0?.name ?? null;
 
-  // Fallback (not your external id, but better than nothing)
-  const fallbackId = sa?.id ?? partAuthor?.id ?? c0?.id ?? null;
+  const externalId = contact0?.external_id ?? null;
+  const fallbackId =
+    sourceAuthor?.id ?? partAuthor?.id ?? contact0?.id ?? null;
 
-  return {
-    user_id: externalId ?? fallbackId ?? null,
-    user_name: bestName ?? null,
-    user_email: bestEmail ?? null,
-  };
+  const user_id = externalId ?? fallbackId ?? null;
+
+  return { user_id, user_name, user_email };
 }
 
 /**
- * Fetch a conversation from Intercom.
- * - Returns null on 404 (skip)
- * - Retries 429 with exponential backoff
+ * Fetch an Intercom conversation.
+ * - 404 returns null (skip)
+ * - 429 retries with exponential backoff
  */
 async function fetchConversation(conversationId, { maxRetries = 5 } = {}) {
   let attempt = 0;
@@ -77,18 +93,12 @@ async function fetchConversation(conversationId, { maxRetries = 5 } = {}) {
       }
     );
 
-    if (res.status === 404) {
-      console.log(`Skipping missing conversation (404): ${conversationId}`);
-      return null;
-    }
+    if (res.status === 404) return null;
 
     if (res.status === 429) {
-      if (attempt > maxRetries) {
-        console.log(`Rate limited too many times; skipping: ${conversationId}`);
-        return null;
-      }
+      if (attempt > maxRetries) return null;
       const waitMs = Math.min(1000 * 2 ** (attempt - 1), 20000);
-      console.log(`429 rate limit. Waiting ${waitMs}ms then retrying...`);
+      console.log(`Intercom 429. Backing off ${waitMs}ms...`);
       await sleep(waitMs);
       continue;
     }
@@ -105,24 +115,16 @@ async function fetchConversation(conversationId, { maxRetries = 5 } = {}) {
 }
 
 /**
- * Update reply rows for this conversation that are missing ANY of:
- * - user_email
- * - user_name
- * - user_id
- *
- * This supports email-only leads too.
+ * Updates replies for a conversation where any of the user fields are null.
+ * Does not overwrite existing non-null values.
  */
 async function updateRepliesForConversation(conversationId, user) {
-  const patch = {
+  const patch = compactPatch({
     user_id: user.user_id,
     user_name: user.user_name,
     user_email: user.user_email,
-  };
+  });
 
-  // Do not overwrite with nulls
-  for (const k of Object.keys(patch)) {
-    if (patch[k] == null) delete patch[k];
-  }
   if (Object.keys(patch).length === 0) return 0;
 
   const { data, error } = await supabase
@@ -136,19 +138,42 @@ async function updateRepliesForConversation(conversationId, user) {
   return data?.length ?? 0;
 }
 
+/**
+ * Optional: verify the schema via Supabase API early.
+ * If this fails with "column does not exist", we stop immediately with a clear message.
+ */
+async function verifySupabaseSchema() {
+  const { error } = await supabase
+    .from("replies")
+    .select("user_email")
+    .limit(1);
+
+  if (error) {
+    // This is the error you're seeing; make it super obvious.
+    throw new Error(
+      `Supabase API cannot query replies.user_email. This usually means you're pointing at the wrong Supabase project/environment or the migration wasn't applied there.\nOriginal error: ${error.message}`
+    );
+  }
+}
+
 async function main() {
-  const BATCH_ROWS = Number(process.env.BATCH_ROWS || 2000);
-  const MAX_CONVERSATIONS = Number(process.env.MAX_CONVERSATIONS || 400);
+  const BATCH_ROWS = Number(process.env.BATCH_ROWS || 3000);
+  const MAX_CONVERSATIONS = Number(process.env.MAX_CONVERSATIONS || 1000);
   const INTERCOM_DELAY_MS = Number(process.env.INTERCOM_DELAY_MS || 150);
   const MAX_LOOPS = Number(process.env.MAX_LOOPS || 999999);
+
+  await verifySupabaseSchema();
 
   let loops = 0;
   let totalUpdatedRows = 0;
   let skipped404 = 0;
   let processedConversations = 0;
 
-  console.log("Backfill starting with:");
-  console.log({ BATCH_ROWS, MAX_CONVERSATIONS, INTERCOM_DELAY_MS });
+  console.log("Backfill config:", {
+    BATCH_ROWS,
+    MAX_CONVERSATIONS,
+    INTERCOM_DELAY_MS,
+  });
 
   while (loops < MAX_LOOPS) {
     loops += 1;
@@ -162,27 +187,27 @@ async function main() {
 
     if (error) throw error;
 
-    if (!rows || rows.length === 0) {
+    if (!rows?.length) {
       console.log("No more rows missing user fields. Done.");
       break;
     }
 
-    const unique = [];
     const seen = new Set();
+    const conversationIds = [];
     for (const r of rows) {
       const id = String(r.conversation_id);
       if (!seen.has(id)) {
         seen.add(id);
-        unique.push(id);
+        conversationIds.push(id);
       }
-      if (unique.length >= MAX_CONVERSATIONS) break;
+      if (conversationIds.length >= MAX_CONVERSATIONS) break;
     }
 
     console.log(
-      `Loop ${loops}: scanned_rows=${rows.length}, conversations_to_process=${unique.length}`
+      `Loop ${loops}: scanned_rows=${rows.length}, conversations_to_process=${conversationIds.length}`
     );
 
-    for (const conversationId of unique) {
+    for (const conversationId of conversationIds) {
       processedConversations += 1;
 
       let conversation;
@@ -190,8 +215,7 @@ async function main() {
         conversation = await fetchConversation(conversationId);
       } catch (e) {
         console.error(
-          `conversation=${conversationId} fatal_fetch_error=`,
-          e?.message ?? e
+          `conversation=${conversationId} intercom_fetch_error=${e?.message ?? e}`
         );
         await sleep(INTERCOM_DELAY_MS);
         continue;
@@ -210,14 +234,11 @@ async function main() {
         totalUpdatedRows += updated;
 
         console.log(
-          `conversation=${conversationId} updated_rows=${updated} total_updated_rows=${totalUpdatedRows} user_name=${
-            user.user_name ?? "null"
-          } user_email=${user.user_email ?? "null"} user_id=${user.user_id ?? "null"}`
+          `conversation=${conversationId} updated_rows=${updated} total_updated_rows=${totalUpdatedRows} user_name=${user.user_name ?? "null"} user_email=${user.user_email ?? "null"} user_id=${user.user_id ?? "null"}`
         );
       } catch (e) {
         console.error(
-          `conversation=${conversationId} update_error=`,
-          JSON.stringify(e, null, 2)
+          `conversation=${conversationId} update_error=${e?.message ?? e}`
         );
       }
 
@@ -225,11 +246,15 @@ async function main() {
     }
   }
 
-  console.log("Backfill finished:");
-  console.log({ loops, processedConversations, totalUpdatedRows, skipped404 });
+  console.log("Backfill finished:", {
+    loops,
+    processedConversations,
+    totalUpdatedRows,
+    skipped404,
+  });
 }
 
 main().catch((e) => {
-  console.error(e);
+  console.error(e?.message ?? e);
   process.exit(1);
 });
