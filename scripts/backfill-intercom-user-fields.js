@@ -137,7 +137,19 @@ async function updateRepliesForConversation(conversationId, user) {
   if (error) throw error;
   return data?.length ?? 0;
 }
+async function apiIntrospectionChecks() {
+  console.log("Running API introspection checks...");
 
+  const t1 = await supabase.from("replies").select("id").limit(1);
+  console.log("select id:", t1.error ? t1.error.message : "ok");
+
+  const t2 = await supabase.from("replies").select("user_email").limit(1);
+  console.log("select user_email:", t2.error ? t2.error.message : "ok");
+
+  if (t2.error) {
+    console.log("user_email full error:", JSON.stringify(t2.error, null, 2));
+  }
+}
 /**
  * Optional: verify the schema via Supabase API early.
  * If this fails with "column does not exist", we stop immediately with a clear message.
