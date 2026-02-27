@@ -127,15 +127,28 @@ async function updateRepliesForConversation(conversationId, user) {
 
   if (Object.keys(patch).length === 0) return 0;
 
-  const { data, error } = await supabase
+  // Step 1: find rows needing update
+  const { data: rows, error: selErr } = await supabase
+    .from("replies")
+    .select("part_id")
+    .eq("conversation_id", conversationId)
+    .or("user_email.is.null,user_name.is.null,user_id.is.null");
+
+  if (selErr) throw selErr;
+  if (!rows?.length) return 0;
+
+  const partIds = rows.map((r) => r.part_id).filter(Boolean);
+  if (!partIds.length) return 0;
+
+  // Step 2: update only those rows
+  const { data: updated, error: updErr } = await supabase
     .from("replies")
     .update(patch)
-    .eq("conversation_id", conversationId)
-    .or("user_email.is.null,user_name.is.null,user_id.is.null")
+    .in("part_id", partIds)
     .select("part_id");
 
-  if (error) throw error;
-  return data?.length ?? 0;
+  if (updErr) throw updErr;
+  return updated?.length ?? 0;
 }
 async function apiIntrospectionChecks() {
   console.log("Running API introspection checks...");
@@ -174,7 +187,6 @@ async function main() {
   const INTERCOM_DELAY_MS = Number(process.env.INTERCOM_DELAY_MS || 150);
   const MAX_LOOPS = Number(process.env.MAX_LOOPS || 999999);
   await apiIntrospectionChecks();
-  process.exit(0);
   await verifySupabaseSchema();
 
   let loops = 0;
