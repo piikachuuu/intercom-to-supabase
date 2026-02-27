@@ -173,7 +173,8 @@ async function main() {
   const MAX_CONVERSATIONS = Number(process.env.MAX_CONVERSATIONS || 1000);
   const INTERCOM_DELAY_MS = Number(process.env.INTERCOM_DELAY_MS || 150);
   const MAX_LOOPS = Number(process.env.MAX_LOOPS || 999999);
-
+  await apiIntrospectionChecks();
+  process.exit(0);
   await verifySupabaseSchema();
 
   let loops = 0;
