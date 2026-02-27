@@ -3,16 +3,20 @@ name: Backfill Intercom user fields into replies
 on:
   workflow_dispatch:
     inputs:
-      max_rows:
-        description: "Max reply rows to process per run"
+      batch_rows:
+        description: "Max reply rows to scan per loop"
         required: false
-        default: "2000"
-      batch_size:
-        description: "Supabase batch size"
+        default: "3000"
+      max_conversations:
+        description: "Max unique conversations to process per run"
         required: false
-        default: "200"
+        default: "1000"
+      intercom_delay_ms:
+        description: "Delay between Intercom calls (ms)"
+        required: false
+        default: "150"
   schedule:
-    - cron: "17 10 * * *" # daily at 10:17 UTC (adjust if you want)
+    - cron: "17 10 * * *" # daily at 10:17 UTC
 
 jobs:
   backfill:
@@ -29,13 +33,32 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # ✅ This is the important new step: prove CI DB has the columns
+      - name: DB sanity check (schema + target project)
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          echo "Checking DB identity..."
+          psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "select current_database(), current_schema(), inet_server_addr(), inet_server_port();"
+          echo "Checking replies columns..."
+          psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "select column_name from information_schema.columns where table_schema='public' and table_name='replies' order by 1;"
+          echo "Checking required column exists (user_email)..."
+          psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "select count(*) as has_user_email from information_schema.columns where table_schema='public' and table_name='replies' and column_name='user_email';" | tee /tmp/has_user_email.txt
+          if ! grep -qE 'has_user_email\s*\|\s*1' /tmp/has_user_email.txt; then
+            echo "ERROR: This database does NOT have public.replies.user_email. Your GitHub secret SUPABASE_DB_URL is pointing to the wrong DB/environment."
+            exit 1
+          fi
+          echo "✅ DB sanity check passed."
+
       - name: Run backfill
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           INTERCOM_ACCESS_TOKEN: ${{ secrets.INTERCOM_ACCESS_TOKEN }}
-        
-          BATCH_ROWS: "3000"
-          MAX_CONVERSATIONS: "1000"
-          INTERCOM_DELAY_MS: "150"
+
+          # Use dispatch inputs if present, otherwise defaults
+          BATCH_ROWS: ${{ inputs.batch_rows || '3000' }}
+          MAX_CONVERSATIONS: ${{ inputs.max_conversations || '1000' }}
+          INTERCOM_DELAY_MS: ${{ inputs.intercom_delay_ms || '150' }}
         run: node scripts/backfill-intercom-user-fields.js
