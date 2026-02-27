@@ -36,5 +36,5 @@ jobs:
           INTERCOM_ACCESS_TOKEN: ${{ secrets.INTERCOM_ACCESS_TOKEN }}
           MAX_ROWS: ${{ github.event.inputs.max_rows || '2000' }}
           BATCH_SIZE: ${{ github.event.inputs.batch_size || '200' }}
-          INTERCOM_DELAY_MS: "250"
+          INTERCOM_DELAY_MS: "150"
         run: node scripts/backfill-intercom-user-fields.js
