@@ -42,7 +42,15 @@ jobs:
         run: |
           echo "Checking replies columns..."
           psql "$SUPABASE_DB_URL" -c "select column_name from information_schema.columns where table_schema='public' and table_name='replies' order by 1;"
-
+      - name: Print Supabase project refs (safe)
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        run: |
+          echo "SUPABASE_URL host:"
+          node -e "console.log(new URL(process.env.SUPABASE_URL).host)"
+          echo "SUPABASE_DB_URL host:"
+          node -e "console.log(new URL(process.env.SUPABASE_DB_URL).host)"
       - name: Run backfill
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
