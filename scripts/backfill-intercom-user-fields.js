@@ -16,30 +16,43 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/**
+ * Lead-safe extraction:
+ * - Email-only is OK.
+ * - user_name can be null.
+ * - "external user id" should go into replies.user_id.
+ *
+ * We try multiple places:
+ * - conversation.contacts.contacts[0].external_id (best for your external id)
+ * - conversation.source.author.id / parts author id (fallbacks)
+ */
 function extractUserFromConversation(conversation) {
   const c0 = conversation?.contacts?.contacts?.[0] ?? null;
+  const sa = conversation?.source?.author ?? null;
 
-  // Best: initial message author if it's a user
-  const sa = conversation?.source?.author;
-  const sourceUser = sa?.type === "user" ? sa : null;
-
-  // Fallback: first user-authored part
-  let firstUserPartAuthor = null;
   const parts = conversation?.conversation_parts?.conversation_parts ?? [];
+  let partAuthor = null;
   for (const p of parts) {
-    if ((p?.author?.type || "").toLowerCase() === "user") {
-      firstUserPartAuthor = p.author;
+    const a = p?.author;
+    if (a?.email || a?.name || a?.id) {
+      partAuthor = a;
       break;
     }
   }
 
-  const best = sourceUser ?? firstUserPartAuthor ?? null;
+  const bestEmail = sa?.email ?? partAuthor?.email ?? c0?.email ?? null;
+  const bestName = sa?.name ?? partAuthor?.name ?? c0?.name ?? null;
+
+  // Your "external user id" (Sleeper user id) should come from Intercom contact external_id
+  const externalId = c0?.external_id ?? null;
+
+  // Fallback (not your external id, but better than nothing)
+  const fallbackId = sa?.id ?? partAuthor?.id ?? c0?.id ?? null;
 
   return {
-    user_id: best?.id ?? c0?.id ?? null,
-    user_name: best?.name ?? null,
-    user_email: best?.email ?? null,
-    user_external_id: c0?.external_id ?? null,
+    user_id: externalId ?? fallbackId ?? null,
+    user_name: bestName ?? null,
+    user_email: bestEmail ?? null,
   };
 }
 
@@ -74,7 +87,6 @@ async function fetchConversation(conversationId, { maxRetries = 5 } = {}) {
         console.log(`Rate limited too many times; skipping: ${conversationId}`);
         return null;
       }
-      // Exponential backoff: 1s, 2s, 4s, 8s, 16s...
       const waitMs = Math.min(1000 * 2 ** (attempt - 1), 20000);
       console.log(`429 rate limit. Waiting ${waitMs}ms then retrying...`);
       await sleep(waitMs);
@@ -93,19 +105,21 @@ async function fetchConversation(conversationId, { maxRetries = 5 } = {}) {
 }
 
 /**
- * Update all reply rows for this conversation that are missing fields.
- * Uses "user_name is null" as the gate so it doesn't re-update forever.
- * (If you also want to fill missing email/external_id even when name exists, tell me.)
+ * Update reply rows for this conversation that are missing ANY of:
+ * - user_email
+ * - user_name
+ * - user_id
+ *
+ * This supports email-only leads too.
  */
 async function updateRepliesForConversation(conversationId, user) {
   const patch = {
     user_id: user.user_id,
     user_name: user.user_name,
     user_email: user.user_email,
-    user_external_id: user.user_external_id,
   };
 
-  // Do not overwrite existing data with nulls
+  // Do not overwrite with nulls
   for (const k of Object.keys(patch)) {
     if (patch[k] == null) delete patch[k];
   }
@@ -115,51 +129,44 @@ async function updateRepliesForConversation(conversationId, user) {
     .from("replies")
     .update(patch)
     .eq("conversation_id", conversationId)
-    .is("user_name", null) // only fill missing (idempotent)
-    .select("part_id"); // returns rows updated (count via length)
+    .or("user_email.is.null,user_name.is.null,user_id.is.null")
+    .select("part_id");
 
   if (error) throw error;
   return data?.length ?? 0;
 }
 
 async function main() {
-  // Tune via workflow env
-  const BATCH_ROWS = Number(process.env.BATCH_ROWS || 2000); // how many rows to scan per loop
-  const MAX_CONVERSATIONS = Number(process.env.MAX_CONVERSATIONS || 400); // convos per run
-  const INTERCOM_DELAY_MS = Number(process.env.INTERCOM_DELAY_MS || 150); // delay per convo
+  const BATCH_ROWS = Number(process.env.BATCH_ROWS || 2000);
+  const MAX_CONVERSATIONS = Number(process.env.MAX_CONVERSATIONS || 400);
+  const INTERCOM_DELAY_MS = Number(process.env.INTERCOM_DELAY_MS || 150);
   const MAX_LOOPS = Number(process.env.MAX_LOOPS || 999999);
 
   let loops = 0;
   let totalUpdatedRows = 0;
   let skipped404 = 0;
-  let skippedRateLimited = 0;
   let processedConversations = 0;
 
   console.log("Backfill starting with:");
-  console.log({
-    BATCH_ROWS,
-    MAX_CONVERSATIONS,
-    INTERCOM_DELAY_MS,
-  });
+  console.log({ BATCH_ROWS, MAX_CONVERSATIONS, INTERCOM_DELAY_MS });
 
   while (loops < MAX_LOOPS) {
     loops += 1;
 
-    // Pull some rows that still need backfill
     const { data: rows, error } = await supabase
       .from("replies")
       .select("conversation_id")
-      .is("user_name", null)
+      .or("user_email.is.null,user_name.is.null,user_id.is.null")
       .not("conversation_id", "is", null)
       .limit(BATCH_ROWS);
 
     if (error) throw error;
+
     if (!rows || rows.length === 0) {
-      console.log("No more rows with user_name = null. Done.");
+      console.log("No more rows missing user fields. Done.");
       break;
     }
 
-    // Unique conversations only
     const unique = [];
     const seen = new Set();
     for (const r of rows) {
@@ -169,11 +176,6 @@ async function main() {
         unique.push(id);
       }
       if (unique.length >= MAX_CONVERSATIONS) break;
-    }
-
-    if (unique.length === 0) {
-      console.log("No unique conversation ids found in batch. Done.");
-      break;
     }
 
     console.log(
@@ -187,17 +189,15 @@ async function main() {
       try {
         conversation = await fetchConversation(conversationId);
       } catch (e) {
-        // non-404/429 errors should be visible (bad token, etc)
-        console.error(`conversation=${conversationId} fatal_fetch_error=${String(e)}`);
-        // keep going; don't fail whole job for one bad row
+        console.error(
+          `conversation=${conversationId} fatal_fetch_error=`,
+          e?.message ?? e
+        );
         await sleep(INTERCOM_DELAY_MS);
         continue;
       }
 
       if (!conversation) {
-        // Could be 404 or too many 429s
-        // We can't distinguish perfectly here because fetchConversation returns null for both.
-        // If you want, we can return {conversation:null, reason:"404"} etc.
         skipped404 += 1;
         await sleep(INTERCOM_DELAY_MS);
         continue;
@@ -212,10 +212,13 @@ async function main() {
         console.log(
           `conversation=${conversationId} updated_rows=${updated} total_updated_rows=${totalUpdatedRows} user_name=${
             user.user_name ?? "null"
-          } external_id=${user.user_external_id ?? "null"}`
+          } user_email=${user.user_email ?? "null"} user_id=${user.user_id ?? "null"}`
         );
       } catch (e) {
-        console.error(`conversation=${conversationId} update_error=${String(e)}`);
+        console.error(
+          `conversation=${conversationId} update_error=`,
+          JSON.stringify(e, null, 2)
+        );
       }
 
       await sleep(INTERCOM_DELAY_MS);
@@ -223,13 +226,7 @@ async function main() {
   }
 
   console.log("Backfill finished:");
-  console.log({
-    loops,
-    processedConversations,
-    totalUpdatedRows,
-    skipped404,
-    skippedRateLimited,
-  });
+  console.log({ loops, processedConversations, totalUpdatedRows, skipped404 });
 }
 
 main().catch((e) => {
