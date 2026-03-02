@@ -40,4 +40,4 @@ jobs:
           OFFSET_CONVERSATIONS: ${{ github.event.inputs.offset }}
           INTERCOM_CONCURRENCY: ${{ github.event.inputs.concurrency }}
           INTERCOM_SLEEP_MS: ${{ github.event.inputs.sleep_ms }}
-        run: node scripts/intercom_backfill_replies.mjs
+        run: node scripts/intercom_backfill_replies.js
