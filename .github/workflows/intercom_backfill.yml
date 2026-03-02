@@ -4,30 +4,32 @@ on:
   workflow_dispatch:
     inputs:
       limit:
-        description: "How many reply rows to scan for missing fields (range query)"
+        description: "How many replies rows to scan in this run"
         required: false
-        default: "2000"
+        default: "5000"
       offset:
-        description: "Offset for scanning reply rows"
+        description: "Offset into replies table"
         required: false
         default: "0"
       concurrency:
         description: "Intercom fetch concurrency"
         required: false
-        default: "3"
+        default: "2"
+      sleep_ms:
+        description: "Sleep ms between Intercom requests per worker"
+        required: false
+        default: "300"
 
 jobs:
   backfill:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Install deps
-        run: npm ci
+      - run: npm ci
 
       - name: Run backfill
         env:
@@ -37,5 +39,5 @@ jobs:
           LIMIT_CONVERSATIONS: ${{ github.event.inputs.limit }}
           OFFSET_CONVERSATIONS: ${{ github.event.inputs.offset }}
           INTERCOM_CONCURRENCY: ${{ github.event.inputs.concurrency }}
-          INTERCOM_SLEEP_MS: "250"
-        run: node scripts/intercom_backfill_replies.js
+          INTERCOM_SLEEP_MS: ${{ github.event.inputs.sleep_ms }}
+        run: node scripts/intercom_backfill_replies.mjs
