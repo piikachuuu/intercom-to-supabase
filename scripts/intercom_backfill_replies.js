@@ -1,22 +1,31 @@
 /**
+ * scripts/intercom_backfill_replies.js
+ *
  * Backfill Intercom-derived columns on existing replies rows.
  *
- * - Pull conversation_ids from Supabase where new columns are NULL
+ * Strategy (scales for ~91k replies rows):
+ * - Scan a slice of `replies` rows (range offset..offset+limit-1) and collect DISTINCT conversation_id
  * - For each conversation_id:
- *    - GET /conversations/:id from Intercom
- *    - reconstruct rows for admin parts
- *    - upsert into public.replies on part_id
+ *   - GET https://api.intercom.io/conversations/:id
+ *   - Rebuild rows for HUMAN ADMIN parts only (author.type === "admin")
+ *   - Compute:
+ *       - user_prev_message + user_prev_message_created_at (true end-user only)
+ *       - is_intercom_note (part_type === "note")
+ *       - conversation_state/open/waiting_since/snoozed_until/updated_at
+ *       - team_assignee_id, assignee_id
+ *       - intercom_inbox_id/name (best-effort; often null)
+ *   - Upsert rows into `public.replies` on conflict part_id
  *
- * Env required:
+ * Required env:
  *   SUPABASE_URL
  *   SUPABASE_SERVICE_ROLE_KEY
  *   INTERCOM_ACCESS_TOKEN
  *
  * Optional env:
- *   LIMIT_CONVERSATIONS (default 500)
- *   OFFSET_CONVERSATIONS (default 0)
- *   INTERCOM_CONCURRENCY (default 3)
- *   INTERCOM_SLEEP_MS (default 250) // between requests per worker
+ *   LIMIT_CONVERSATIONS        (default 5000)  // actually "reply rows to scan" per run
+ *   OFFSET_CONVERSATIONS       (default 0)
+ *   INTERCOM_CONCURRENCY       (default 2)
+ *   INTERCOM_SLEEP_MS          (default 300)
  */
 
 import { createClient } from "@supabase/supabase-js";
@@ -26,14 +35,16 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const INTERCOM_ACCESS_TOKEN = process.env.INTERCOM_ACCESS_TOKEN;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !INTERCOM_ACCESS_TOKEN) {
-  console.error("Missing env vars: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, INTERCOM_ACCESS_TOKEN");
+  console.error(
+    "Missing env vars: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, INTERCOM_ACCESS_TOKEN",
+  );
   process.exit(1);
 }
 
-const LIMIT_CONVERSATIONS = Number(process.env.LIMIT_CONVERSATIONS ?? "500");
+const LIMIT_CONVERSATIONS = Number(process.env.LIMIT_CONVERSATIONS ?? "5000");
 const OFFSET_CONVERSATIONS = Number(process.env.OFFSET_CONVERSATIONS ?? "0");
-const INTERCOM_CONCURRENCY = Number(process.env.INTERCOM_CONCURRENCY ?? "3");
-const INTERCOM_SLEEP_MS = Number(process.env.INTERCOM_SLEEP_MS ?? "250");
+const INTERCOM_CONCURRENCY = Number(process.env.INTERCOM_CONCURRENCY ?? "2");
+const INTERCOM_SLEEP_MS = Number(process.env.INTERCOM_SLEEP_MS ?? "300");
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
@@ -96,7 +107,6 @@ function extractUserFromConversation(conversation) {
   const c0 = conversation?.contacts?.contacts?.[0] ?? null;
   const sa = conversation?.source?.author ?? null;
 
-  // prefer contact external_id as your app user id
   const user_id = c0?.external_id ?? null;
   const user_email = sa?.email ?? null;
   const user_name = sa?.name ?? null;
@@ -105,7 +115,7 @@ function extractUserFromConversation(conversation) {
 }
 
 function extractInbox(conversation) {
-  // Not guaranteed present. Best-effort only.
+  // Not guaranteed present in conversation payload.
   const inboxId =
     conversation?.inbox?.id ??
     conversation?.source?.inbox?.id ??
@@ -126,7 +136,6 @@ function extractInbox(conversation) {
 
 function collectMessages(conversation) {
   const messages = [];
-
   if (conversation?.source) messages.push({ ...conversation.source, _from: "source" });
 
   const parts = conversation?.conversation_parts?.conversation_parts || [];
@@ -136,12 +145,21 @@ function collectMessages(conversation) {
   return messages;
 }
 
+/**
+ * IMPORTANT: Only accept true end-user messages as "previous user message":
+ * - author.type must be user|lead
+ * - body must exist
+ * - must be either:
+ *   - conversation.source (initial message), OR
+ *   - a conversation_part with part_type === "comment"
+ * This prevents bot/system parts from being captured as the "user" message.
+ */
 function findPreviousEndUserMessage(messages, i) {
   for (let j = i - 1; j >= 0; j--) {
     const prev = messages[j];
 
     const authorType = String(prev?.author?.type || "").toLowerCase();
-    if (!(authorType === "user" || authorType === "lead")) continue; // excludes bot/admin
+    if (!(authorType === "user" || authorType === "lead")) continue;
 
     const bodyText = htmlToText(prev?.body || "");
     if (!bodyText.trim()) continue;
@@ -160,7 +178,6 @@ function findPreviousEndUserMessage(messages, i) {
 }
 
 async function fetchIntercomConversation(conversationId) {
-  // simple retry with backoff on 429/5xx
   for (let attempt = 0; attempt < 6; attempt++) {
     const res = await fetch(`https://api.intercom.io/conversations/${conversationId}`, {
       headers: {
@@ -175,7 +192,9 @@ async function fetchIntercomConversation(conversationId) {
     const retryable = res.status === 429 || (res.status >= 500 && res.status <= 599);
 
     if (!retryable || attempt === 5) {
-      throw new Error(`Intercom fetch failed ${res.status} for ${conversationId}: ${body.slice(0, 500)}`);
+      throw new Error(
+        `Intercom fetch failed ${res.status} for ${conversationId}: ${body.slice(0, 500)}`,
+      );
     }
 
     const backoff = 500 * Math.pow(2, attempt);
@@ -185,56 +204,36 @@ async function fetchIntercomConversation(conversationId) {
   throw new Error(`Intercom fetch failed for ${conversationId}`);
 }
 
-async function getConversationIdsNeedingBackfill(limit, offset) {
-  // Pull distinct conversation_ids where any new fields are null
-  // NOTE: Supabase JS doesn't have a perfect "distinct" builder; we do:
-  // select conversation_id and then unique in JS.
+async function getConversationIdsForSlice(limit, offset) {
   const { data, error } = await supabase
     .from("replies")
-    .select(
-      "conversation_id, conversation_state, conversation_open, conversation_waiting_since, conversation_updated_at, user_prev_message_created_at, is_intercom_note, intercom_inbox_id, intercom_inbox_name",
-    )
+    .select("conversation_id")
     .range(offset, offset + limit - 1);
 
   if (error) throw new Error(`Failed to query replies: ${error.message}`);
 
-  const need = [];
-  for (const r of data ?? []) {
-    const missing =
-      r.conversation_state == null ||
-      r.conversation_open == null ||
-      r.conversation_waiting_since == null ||
-      r.conversation_updated_at == null ||
-      r.user_prev_message_created_at == null ||
-      r.is_intercom_note == null; // note: could be null for older rows
+  const ids = (data ?? [])
+    .map((r) => (r?.conversation_id != null ? String(r.conversation_id) : null))
+    .filter(Boolean);
 
-    if (missing && r.conversation_id) need.push(String(r.conversation_id));
-  }
-
-  return Array.from(new Set(need));
-}
-
-async function upsertRows(rows) {
-  if (!rows.length) return { updated: 0 };
-  const { error } = await supabase.from("replies").upsert(rows, { onConflict: "part_id" });
-  if (error) throw new Error(`Supabase upsert failed: ${error.message}`);
-  return { updated: rows.length };
+  return Array.from(new Set(ids));
 }
 
 function buildRowsFromConversation(conversation) {
-  const conversationId = String(conversation?.id ?? "");
+  const conversationId = conversation?.id != null ? String(conversation.id) : null;
   if (!conversationId) return [];
 
   const tags = extractTagsFromConversation(conversation);
   const { user_id, user_name, user_email } = extractUserFromConversation(conversation);
   const { intercom_inbox_id, intercom_inbox_name } = extractInbox(conversation);
 
-  // Conversation-level fields (Intercom)
+  // Conversation-level Intercom fields
   const conversation_state = conversation?.state ?? null;
   const conversation_open = typeof conversation?.open === "boolean" ? conversation.open : null;
   const conversation_waiting_since = epochToIso(asNumber(conversation?.waiting_since));
   const conversation_snoozed_until = epochToIso(asNumber(conversation?.snoozed_until));
   const conversation_updated_at = epochToIso(asNumber(conversation?.updated_at));
+
   const team_assignee_id =
     conversation?.team_assignee_id != null ? String(conversation.team_assignee_id) : null;
   const assignee_id =
@@ -246,9 +245,9 @@ function buildRowsFromConversation(conversation) {
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
-    const authorType = String(msg?.author?.type || "").toLowerCase();
 
-    // Only human teammate replies
+    // Only HUMAN teammate replies (exclude bots)
+    const authorType = String(msg?.author?.type || "").toLowerCase();
     if (authorType !== "admin") continue;
 
     const bodyText = htmlToText(msg?.body || "");
@@ -268,6 +267,7 @@ function buildRowsFromConversation(conversation) {
 
     rows.push({
       pulled_at: new Date().toISOString(),
+
       conversation_id: conversationId,
       part_id: String(partId),
       reply_created_at,
@@ -292,12 +292,14 @@ function buildRowsFromConversation(conversation) {
       conversation_snoozed_until,
       conversation_updated_at,
 
-      // legacy + intercom inbox columns
-      inbox: intercom_inbox_id, // optional legacy column
+      // Inbox columns
+      // (You also have a legacy `inbox` column; keeping it synced to intercom_inbox_id is fine.)
+      inbox: intercom_inbox_id,
       intercom_inbox_id,
       intercom_inbox_name,
 
-      is_intercom_note,
+      // ✅ backfill this
+      is_intercom_note: is_intercom_note,
 
       agent_reply: bodyText,
     });
@@ -306,24 +308,36 @@ function buildRowsFromConversation(conversation) {
   return rows;
 }
 
+async function upsertRows(rows) {
+  if (!rows.length) return 0;
+
+  const { error } = await supabase.from("replies").upsert(rows, { onConflict: "part_id" });
+  if (error) throw new Error(`Supabase upsert failed: ${error.message}`);
+
+  return rows.length;
+}
+
 async function run() {
   console.log("Backfill starting", {
-    LIMIT_CONVERSATIONS,
-    OFFSET_CONVERSATIONS,
-    INTERCOM_CONCURRENCY,
-    INTERCOM_SLEEP_MS,
+    scan_reply_rows_limit: LIMIT_CONVERSATIONS,
+    scan_reply_rows_offset: OFFSET_CONVERSATIONS,
+    intercom_concurrency: INTERCOM_CONCURRENCY,
+    intercom_sleep_ms: INTERCOM_SLEEP_MS,
   });
 
-  const conversationIds = await getConversationIdsNeedingBackfill(LIMIT_CONVERSATIONS, OFFSET_CONVERSATIONS);
+  const conversationIds = await getConversationIdsForSlice(
+    LIMIT_CONVERSATIONS,
+    OFFSET_CONVERSATIONS,
+  );
 
-  console.log(`Found ${conversationIds.length} conversation_ids needing backfill`);
+  console.log(`Found ${conversationIds.length} distinct conversation_ids in this slice`);
 
   let processed = 0;
-  let totalRowsUpserted = 0;
+  let rowsUpserted = 0;
   let errors = 0;
 
-  // simple worker pool
   let idx = 0;
+
   async function worker(workerId) {
     while (true) {
       const my = idx++;
@@ -334,22 +348,23 @@ async function run() {
       try {
         const conversation = await fetchIntercomConversation(conversationId);
         const rows = buildRowsFromConversation(conversation);
-
-        const { updated } = await upsertRows(rows);
-        totalRowsUpserted += updated;
+        const n = await upsertRows(rows);
+        rowsUpserted += n;
         processed++;
 
         if (processed % 25 === 0) {
-          console.log(`Progress: processed=${processed}/${conversationIds.length} upserted_rows=${totalRowsUpserted} errors=${errors}`);
+          console.log(
+            `Progress: processed=${processed}/${conversationIds.length} rows_upserted=${rowsUpserted} errors=${errors}`,
+          );
         }
       } catch (e) {
         errors++;
         console.error(`Error backfilling conversation ${conversationId}:`, e?.message ?? e);
       }
 
-      // gentle pacing
       await sleep(INTERCOM_SLEEP_MS);
     }
+
     console.log(`Worker ${workerId} done`);
   }
 
@@ -359,7 +374,7 @@ async function run() {
   console.log("Backfill finished", {
     conversations_targeted: conversationIds.length,
     conversations_processed: processed,
-    rows_upserted: totalRowsUpserted,
+    rows_upserted: rowsUpserted,
     errors,
   });
 
