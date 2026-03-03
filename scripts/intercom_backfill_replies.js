@@ -1,20 +1,15 @@
 /**
  * scripts/intercom_backfill_replies.js
  *
- * Backfill Intercom-derived columns on existing replies rows.
- *
- * Strategy (scales for ~91k replies rows):
- * - Scan a slice of `replies` rows (range offset..offset+limit-1) and collect DISTINCT conversation_id
- * - For each conversation_id:
- *   - GET https://api.intercom.io/conversations/:id
- *   - Rebuild rows for HUMAN ADMIN parts only (author.type === "admin")
- *   - Compute:
- *       - user_prev_message + user_prev_message_created_at (true end-user only)
- *       - is_intercom_note (part_type === "note")
- *       - conversation_state/open/waiting_since/snoozed_until/updated_at
- *       - team_assignee_id, assignee_id
- *       - intercom_inbox_id/name (best-effort; often null)
- *   - Upsert rows into `public.replies` on conflict part_id
+ * Auto-draining backfill worker:
+ * - Each run selects conversations from replies where any of:
+ *   - conversation_state IS NULL
+ *   - is_intercom_note IS NULL
+ *   - user_prev_message_created_at IS NULL
+ * - Fetch conversation from Intercom
+ * - Rebuild rows for HUMAN ADMIN parts only (author.type === "admin")
+ * - Upsert into public.replies onConflict: part_id
+ * - After run, checks remaining rows; writes GitHub Actions outputs.
  *
  * Required env:
  *   SUPABASE_URL
@@ -22,13 +17,13 @@
  *   INTERCOM_ACCESS_TOKEN
  *
  * Optional env:
- *   LIMIT_CONVERSATIONS        (default 5000)  // actually "reply rows to scan" per run
- *   OFFSET_CONVERSATIONS       (default 0)
- *   INTERCOM_CONCURRENCY       (default 2)
- *   INTERCOM_SLEEP_MS          (default 300)
+ *   LIMIT_REPLIES_SCAN (default 5000)       // how many reply rows to look at each run
+ *   INTERCOM_CONCURRENCY (default 2)
+ *   INTERCOM_SLEEP_MS (default 300)
  */
 
 import { createClient } from "@supabase/supabase-js";
+import fs from "node:fs";
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -41,8 +36,7 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !INTERCOM_ACCESS_TOKEN) {
   process.exit(1);
 }
 
-const LIMIT_CONVERSATIONS = Number(process.env.LIMIT_CONVERSATIONS ?? "5000");
-const OFFSET_CONVERSATIONS = Number(process.env.OFFSET_CONVERSATIONS ?? "0");
+const LIMIT_REPLIES_SCAN = Number(process.env.LIMIT_REPLIES_SCAN ?? "5000");
 const INTERCOM_CONCURRENCY = Number(process.env.INTERCOM_CONCURRENCY ?? "2");
 const INTERCOM_SLEEP_MS = Number(process.env.INTERCOM_SLEEP_MS ?? "300");
 
@@ -107,15 +101,15 @@ function extractUserFromConversation(conversation) {
   const c0 = conversation?.contacts?.contacts?.[0] ?? null;
   const sa = conversation?.source?.author ?? null;
 
-  const user_id = c0?.external_id ?? null;
-  const user_email = sa?.email ?? null;
-  const user_name = sa?.name ?? null;
-
-  return { user_id, user_name, user_email };
+  return {
+    user_id: c0?.external_id ?? null,
+    user_name: sa?.name ?? null,
+    user_email: sa?.email ?? null,
+  };
 }
 
 function extractInbox(conversation) {
-  // Not guaranteed present in conversation payload.
+  // Best-effort only (Intercom often omits inbox from this endpoint)
   const inboxId =
     conversation?.inbox?.id ??
     conversation?.source?.inbox?.id ??
@@ -136,6 +130,7 @@ function extractInbox(conversation) {
 
 function collectMessages(conversation) {
   const messages = [];
+
   if (conversation?.source) messages.push({ ...conversation.source, _from: "source" });
 
   const parts = conversation?.conversation_parts?.conversation_parts || [];
@@ -146,18 +141,15 @@ function collectMessages(conversation) {
 }
 
 /**
- * IMPORTANT: Only accept true end-user messages as "previous user message":
+ * Only accept real end-user messages as "previous user message":
  * - author.type must be user|lead
- * - body must exist
- * - must be either:
- *   - conversation.source (initial message), OR
- *   - a conversation_part with part_type === "comment"
- * This prevents bot/system parts from being captured as the "user" message.
+ * - must have body
+ * - must be:
+ *   - conversation.source OR part_type === "comment"
  */
 function findPreviousEndUserMessage(messages, i) {
   for (let j = i - 1; j >= 0; j--) {
     const prev = messages[j];
-
     const authorType = String(prev?.author?.type || "").toLowerCase();
     if (!(authorType === "user" || authorType === "lead")) continue;
 
@@ -204,11 +196,18 @@ async function fetchIntercomConversation(conversationId) {
   throw new Error(`Intercom fetch failed for ${conversationId}`);
 }
 
-async function getConversationIdsForSlice(limit, offset) {
+/**
+ * Auto-draining selector:
+ * Pull a bunch of reply rows that still need backfill, then dedupe to conversation_ids.
+ */
+async function getConversationIdsNeedingBackfill(limitReplyRows) {
   const { data, error } = await supabase
     .from("replies")
     .select("conversation_id")
-    .range(offset, offset + limit - 1);
+    .or(
+      "conversation_state.is.null,is_intercom_note.is.null,user_prev_message_created_at.is.null",
+    )
+    .limit(limitReplyRows);
 
   if (error) throw new Error(`Failed to query replies: ${error.message}`);
 
@@ -227,7 +226,7 @@ function buildRowsFromConversation(conversation) {
   const { user_id, user_name, user_email } = extractUserFromConversation(conversation);
   const { intercom_inbox_id, intercom_inbox_name } = extractInbox(conversation);
 
-  // Conversation-level Intercom fields
+  // Conversation-level fields
   const conversation_state = conversation?.state ?? null;
   const conversation_open = typeof conversation?.open === "boolean" ? conversation.open : null;
   const conversation_waiting_since = epochToIso(asNumber(conversation?.waiting_since));
@@ -240,14 +239,13 @@ function buildRowsFromConversation(conversation) {
     conversation?.admin_assignee_id != null ? String(conversation.admin_assignee_id) : null;
 
   const messages = collectMessages(conversation);
-
   const rows = [];
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
-
-    // Only HUMAN teammate replies (exclude bots)
     const authorType = String(msg?.author?.type || "").toLowerCase();
+
+    // Only HUMAN teammate replies (exclude bot)
     if (authorType !== "admin") continue;
 
     const bodyText = htmlToText(msg?.body || "");
@@ -267,9 +265,9 @@ function buildRowsFromConversation(conversation) {
 
     rows.push({
       pulled_at: new Date().toISOString(),
-
       conversation_id: conversationId,
       part_id: String(partId),
+
       reply_created_at,
 
       teammate_id: msg?.author?.id != null ? String(msg.author.id) : null,
@@ -292,14 +290,12 @@ function buildRowsFromConversation(conversation) {
       conversation_snoozed_until,
       conversation_updated_at,
 
-      // Inbox columns
-      // (You also have a legacy `inbox` column; keeping it synced to intercom_inbox_id is fine.)
-      inbox: intercom_inbox_id,
+      // Inbox fields (best-effort)
+      inbox: intercom_inbox_id, // legacy column kept in sync
       intercom_inbox_id,
       intercom_inbox_name,
 
-      // ✅ backfill this
-      is_intercom_note: is_intercom_note,
+      is_intercom_note,
 
       agent_reply: bodyText,
     });
@@ -317,20 +313,50 @@ async function upsertRows(rows) {
   return rows.length;
 }
 
+/**
+ * Remaining work tracker (rows still missing any of the backfilled fields).
+ */
+async function getRemainingRowsCount() {
+  // We only need an estimate of "still missing", so select count with head:true.
+  const { count, error } = await supabase
+    .from("replies")
+    .select("id", { count: "exact", head: true })
+    .or(
+      "conversation_state.is.null,is_intercom_note.is.null,user_prev_message_created_at.is.null",
+    );
+
+  if (error) throw new Error(`Failed to count remaining rows: ${error.message}`);
+  return Number(count ?? 0);
+}
+
+function writeGithubOutput(k, v) {
+  const outPath = process.env.GITHUB_OUTPUT;
+  if (!outPath) return;
+  fs.appendFileSync(outPath, `${k}=${String(v)}\n`);
+}
+
 async function run() {
-  console.log("Backfill starting", {
-    scan_reply_rows_limit: LIMIT_CONVERSATIONS,
-    scan_reply_rows_offset: OFFSET_CONVERSATIONS,
-    intercom_concurrency: INTERCOM_CONCURRENCY,
-    intercom_sleep_ms: INTERCOM_SLEEP_MS,
+  console.log("Backfill run starting", {
+    LIMIT_REPLIES_SCAN,
+    INTERCOM_CONCURRENCY,
+    INTERCOM_SLEEP_MS,
   });
 
-  const conversationIds = await getConversationIdsForSlice(
-    LIMIT_CONVERSATIONS,
-    OFFSET_CONVERSATIONS,
-  );
+  const conversationIds = await getConversationIdsNeedingBackfill(LIMIT_REPLIES_SCAN);
 
-  console.log(`Found ${conversationIds.length} distinct conversation_ids in this slice`);
+  if (conversationIds.length === 0) {
+    const remaining = await getRemainingRowsCount();
+    console.log("No conversations to process in this run.", { remaining_rows: remaining });
+
+    const done = remaining === 0;
+    writeGithubOutput("done", done ? "true" : "false");
+    writeGithubOutput("remaining_rows", remaining);
+
+    // exit cleanly
+    return;
+  }
+
+  console.log(`Found ${conversationIds.length} distinct conversation_ids to backfill this run`);
 
   let processed = 0;
   let rowsUpserted = 0;
@@ -349,6 +375,7 @@ async function run() {
         const conversation = await fetchIntercomConversation(conversationId);
         const rows = buildRowsFromConversation(conversation);
         const n = await upsertRows(rows);
+
         rowsUpserted += n;
         processed++;
 
@@ -371,17 +398,27 @@ async function run() {
   const workers = Array.from({ length: INTERCOM_CONCURRENCY }, (_, i) => worker(i + 1));
   await Promise.all(workers);
 
-  console.log("Backfill finished", {
+  const remaining = await getRemainingRowsCount();
+  const done = remaining === 0;
+
+  console.log("Backfill run finished", {
     conversations_targeted: conversationIds.length,
     conversations_processed: processed,
     rows_upserted: rowsUpserted,
     errors,
+    remaining_rows: remaining,
+    done,
   });
 
+  writeGithubOutput("done", done ? "true" : "false");
+  writeGithubOutput("remaining_rows", remaining);
+
+  // If you want failures to show up in Actions, keep non-zero exit on errors:
   if (errors > 0) process.exitCode = 1;
 }
 
 run().catch((e) => {
   console.error("Fatal:", e?.message ?? e);
+  writeGithubOutput("done", "false");
   process.exit(1);
 });
