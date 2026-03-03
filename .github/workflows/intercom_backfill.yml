@@ -3,10 +3,15 @@ name: Intercom Replies Backfill
 on:
   schedule:
     - cron: "*/5 * * * *"
+  workflow_dispatch:
 
 concurrency:
   group: intercom-backfill
   cancel-in-progress: false
+
+permissions:
+  actions: write   # needed to disable workflow
+  contents: read
 
 jobs:
   backfill:
@@ -19,11 +24,30 @@ jobs:
 
       - run: npm ci
 
-      - name: Run backfill
+      - name: Run backfill worker
+        id: backfill
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           INTERCOM_ACCESS_TOKEN: ${{ secrets.INTERCOM_ACCESS_TOKEN }}
-          INTERCOM_CONCURRENCY: 3
-          INTERCOM_SLEEP_MS: 250
+          LIMIT_REPLIES_SCAN: "5000"
+          INTERCOM_CONCURRENCY: "2"
+          INTERCOM_SLEEP_MS: "300"
         run: node scripts/intercom_backfill_replies.mjs
+
+      - name: Show outputs
+        run: |
+          echo "done=${{ steps.backfill.outputs.done }}"
+          echo "remaining_rows=${{ steps.backfill.outputs.remaining_rows }}"
+
+      # Auto-disable this workflow when finished
+      - name: Disable workflow when done
+        if: ${{ steps.backfill.outputs.done == 'true' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const workflow_id = "intercom_backfill.yml"; // <-- MUST match this file name
+            await github.rest.actions.disableWorkflow({ owner, repo, workflow_id });
+            core.info(`Disabled workflow ${workflow_id} because backfill is done.`);
