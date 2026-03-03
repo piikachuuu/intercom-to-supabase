@@ -1,24 +1,12 @@
 name: Intercom Replies Backfill
 
 on:
-  workflow_dispatch:
-    inputs:
-      limit:
-        description: "How many replies rows to scan in this run"
-        required: false
-        default: "5000"
-      offset:
-        description: "Offset into replies table"
-        required: false
-        default: "0"
-      concurrency:
-        description: "Intercom fetch concurrency"
-        required: false
-        default: "2"
-      sleep_ms:
-        description: "Sleep ms between Intercom requests per worker"
-        required: false
-        default: "300"
+  schedule:
+    - cron: "*/5 * * * *"
+
+concurrency:
+  group: intercom-backfill
+  cancel-in-progress: false
 
 jobs:
   backfill:
@@ -36,8 +24,6 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           INTERCOM_ACCESS_TOKEN: ${{ secrets.INTERCOM_ACCESS_TOKEN }}
-          LIMIT_CONVERSATIONS: ${{ github.event.inputs.limit }}
-          OFFSET_CONVERSATIONS: ${{ github.event.inputs.offset }}
-          INTERCOM_CONCURRENCY: ${{ github.event.inputs.concurrency }}
-          INTERCOM_SLEEP_MS: ${{ github.event.inputs.sleep_ms }}
-        run: node scripts/intercom_backfill_replies.js
+          INTERCOM_CONCURRENCY: 3
+          INTERCOM_SLEEP_MS: 250
+        run: node scripts/intercom_backfill_replies.mjs
