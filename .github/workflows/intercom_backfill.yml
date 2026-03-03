@@ -33,7 +33,7 @@ jobs:
           LIMIT_REPLIES_SCAN: "5000"
           INTERCOM_CONCURRENCY: "2"
           INTERCOM_SLEEP_MS: "300"
-        run: node scripts/intercom_backfill_replies.mjs
+        run: node scripts/intercom_backfill_replies.js
 
       - name: Show outputs
         run: |
